@@ -1,0 +1,6 @@
+# Microsoft Qlib Quantitative Trading & Supabase Pipeline Requirements
+
+numpy>=1.22.0
+pandas>=1.5.0
+yfinance>=0.2.30
+yahooquery>=2.3.7
