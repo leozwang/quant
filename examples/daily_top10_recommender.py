@@ -10,9 +10,17 @@ daily setups with precise entry, stop-loss, and profit targets.
 import argparse
 from datetime import datetime
 import os
+import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# Ensure sibling modules resolve when this script is executed directly.
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+
+from market_calendar import last_completed_session, next_trading_day, now_et
 
 # ==============================================================================
 # 1. Candidate Universe: High-Liquidity US Equities, Growth Leaders & Active ETFs
@@ -24,6 +32,11 @@ UNIVERSE = {
     "IWM": ("Small Cap", "iShares Russell 2000 ETF"),
     "SMH": ("Semiconductors", "VanEck Semiconductor ETF"),
     "XLK": ("Technology", "Technology Select Sector SPDR"),
+    # Tagged "Technology" (not a bespoke label) so it competes under the same
+    # 2-per-sector cap as XLK and the tech single-names. Giving it its own
+    # sector would exempt it from that contest and quietly bias it into the
+    # top-N regardless of signal strength.
+    "VGT": ("Technology", "Vanguard Information Technology ETF"),
     "XLE": ("Energy", "Energy Select Sector SPDR"),
     "XLF": ("Financials", "Financial Select Sector SPDR"),
     "XLV": ("Healthcare", "Health Care Select Sector SPDR"),
@@ -149,10 +162,21 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=7).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=7).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi_7 = float((100 - (100 / (1 + rs))).iloc[-1])
-    if np.isnan(rsi_7):
-        rsi_7 = 50.0
+
+    # A window with no down days makes average loss 0. Dividing by NaN and
+    # falling back to 50 would report such a stock as *neutral* when it is in
+    # fact maximally overbought (RSI 100 by definition). That matters here
+    # because rsi_7 > 82 carries a blow-off-top penalty and rsi_7 > 58 triggers
+    # the mean-reversion dampener -- so the strongest, most extended names were
+    # silently escaping both guards.
+    _gain = gain.iloc[-1]
+    _loss = loss.iloc[-1]
+    if pd.isna(_gain) or pd.isna(_loss):
+        rsi_7 = 50.0                      # not enough history to judge
+    elif _loss == 0:
+        rsi_7 = 100.0 if _gain > 0 else 50.0   # all up, or completely flat
+    else:
+        rsi_7 = float(100 - (100 / (1 + (_gain / _loss))))
 
     # 7. Bollinger Band Position (%B over 20 days, 2 std)
     sma_20 = close.rolling(window=20).mean()
@@ -261,7 +285,17 @@ def assess_market_regime(spy_df: pd.DataFrame, qqq_df: pd.DataFrame) -> dict:
 # ==============================================================================
 # 4. Main Scoring & Recommendation Pipeline
 # ==============================================================================
-def run_daily_recommender(top_n: int = 10, export_csv: str = None):
+def run_daily_recommender(top_n: int = 10, export_csv: str = None,
+                          expected_baseline: str = None):
+    """Generate the daily top-N recommendations.
+
+    expected_baseline: optional 'YYYY-MM-DD'. If supplied, the session that the
+        downloaded data actually represents MUST equal this date, or the run is
+        aborted. The caller (the orchestrator) derives this from the market
+        calendar; the data derives it from the provider. Requiring the two to
+        agree is what prevents acting on a stale or half-formed bar -- see the
+        baseline check below for why that matters.
+    """
     print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Downloading market data for universe of {len(UNIVERSE)} assets...")
     tickers_list = list(UNIVERSE.keys())
 
@@ -270,7 +304,8 @@ def run_daily_recommender(top_n: int = 10, export_csv: str = None):
 
     if "SPY" not in data or "QQQ" not in data:
         print("Error: Could not retrieve SPY/QQQ benchmark data.")
-        return
+        # Must match the success-path arity; callers unpack two values.
+        return [], None
 
     # Ensure latest session bar is complete: if today's row exists with NaN close (intraday / near close),
     # populate OHLCV from fast_info so today's completed session is captured accurately.
@@ -303,29 +338,90 @@ def run_daily_recommender(top_n: int = 10, export_csv: str = None):
     market_info = assess_market_regime(spy_df, qqq_df)
     trading_day = market_info["last_date"]
 
+    # ==========================================================================
+    # Session-agreement check (fail closed on stale or half-formed data)
+    # ==========================================================================
+    # The orchestrator derives the expected session from the market calendar;
+    # `trading_day` is derived from whatever the data provider actually returned.
+    # These agree only while the provider is current. When they disagree it means
+    # one of:
+    #
+    #   * the provider has not yet published the session we expect (lag), or
+    #   * the last row is *today* mid-session -- possibly a synthetic bar built
+    #     from live quotes by the fast_info backfill above, which is NOT a close.
+    #
+    # Continuing in either case writes a prediction stamped with the wrong
+    # target_date. Those rows then settle against an already-known close, which
+    # silently flatters the accuracy statistics. Skipping and retrying on the
+    # next invocation costs nothing, because the job is idempotent.
+    if expected_baseline and trading_day != expected_baseline:
+        print(
+            f"\n  ⚠️ [DAILY] Session mismatch: data baseline is '{trading_day}' but the "
+            f"calendar expects '{expected_baseline}'."
+        )
+        print("     Refusing to generate a prediction from a session that does not match.")
+        print("     This is normally provider lag; the next scheduled run will retry.\n")
+        # Distinguishable from a genuine failure (which returns None) so the
+        # orchestrator does not raise an alert for an ordinary, self-healing skip.
+        return [], {
+            "skipped": "session_mismatch",
+            "data_baseline": trading_day,
+            "expected_baseline": expected_baseline,
+        }
+
     results = []
+    skipped = {"missing": [], "short": [], "stale": [], "error": []}
+    benchmark_last = spy_df.index[-1]
+
     for symbol, (sector, name) in UNIVERSE.items():
         try:
             if symbol not in data:
+                skipped["missing"].append(symbol)
                 continue
             df = data[symbol].dropna()
             if len(df) < 30:
+                skipped["short"].append(symbol)
+                continue
+
+            # dropna() removes today's row entirely if this ticker has any NaN in
+            # it (halt, late print, provider gap). df.iloc[-1] would then silently
+            # be YESTERDAY's bar, while spy_df.iloc[-1] is today's -- so every
+            # relative-strength and beta figure would compare misaligned sessions,
+            # and the row would still be stamped with today's trade_date.
+            # Require the ticker to be on the same session as the benchmark.
+            if df.index[-1] != benchmark_last:
+                skipped["stale"].append(symbol)
                 continue
 
             metrics = calculate_daily_factors(df, spy_df)
             if metrics is None:
+                skipped["error"].append(symbol)
                 continue
 
             metrics["symbol"] = symbol
             metrics["sector"] = sector
             metrics["name"] = name
             results.append(metrics)
-        except Exception:
+        except Exception as e:
+            # Previously a bare `continue`, which meant a systematic failure
+            # could silently shrink the universe with no trace at all.
+            skipped["error"].append(f"{symbol}({type(e).__name__})")
             continue
+
+    dropped = sum(len(v) for v in skipped.values())
+    if dropped:
+        print(f"  ℹ️ {len(results)}/{len(UNIVERSE)} tickers usable; {dropped} skipped.")
+        for reason, syms in skipped.items():
+            if syms:
+                shown = ", ".join(str(s) for s in syms[:8])
+                more = f" (+{len(syms) - 8} more)" if len(syms) > 8 else ""
+                print(f"       {reason:8}: {shown}{more}")
+
 
     if not results:
         print("Error: No qualifying candidate data processed.")
-        return
+        # Must match the success-path arity; callers unpack two values.
+        return [], None
 
     res_df = pd.DataFrame(results)
 
@@ -376,11 +472,12 @@ def run_daily_recommender(top_n: int = 10, export_csv: str = None):
     # ==============================================================================
     # 5. Formatted Output Presentation
     # ==============================================================================
-    # Calculate executable date (published timestamp) and target trading date upfront
+    # Calculate executable date (published timestamp) and target trading date upfront.
+    # next_trading_day() skips weekends AND exchange holidays; the previous weekday-offset
+    # arithmetic could place target_date on a closed session, which then never settles.
     trade_dt = datetime.strptime(trading_day, "%Y-%m-%d")
-    target_offset = 3 if trade_dt.weekday() == 4 else (2 if trade_dt.weekday() == 5 else 1)
-    target_day_str = (trade_dt + pd.Timedelta(days=target_offset)).strftime("%Y-%m-%d")
-    exec_dt_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    target_day_str = next_trading_day(trade_dt.date()).strftime("%Y-%m-%d")
+    exec_dt_str = now_et().strftime("%Y-%m-%d %H:%M:%S")
 
     print("\n" + "=" * 115)
     print(f"               DAILY QUANTITATIVE TOP {top_n} RECOMMENDATIONS (NEXT-SESSION FOCUS)")
@@ -500,6 +597,14 @@ if __name__ == "__main__":
         default=False,
         help="Force upload to Supabase even if records for today already exist"
     )
+    parser.add_argument(
+        "--no-session-check",
+        action="store_true",
+        default=False,
+        help="Skip the session-agreement guard and compute on whatever the provider "
+             "returns. Intended for inspecting signals while the market is open; the "
+             "resulting numbers are based on an incomplete bar."
+    )
     args = parser.parse_args()
 
     # Inform user of execution mode upfront
@@ -507,9 +612,23 @@ if __name__ == "__main__":
         print("\n🔍 [DRY-RUN MODE] Calculating and displaying recommendations to screen only.")
         print("   (No data will be written to Supabase database. Pass --upload to enable cloud sync)\n")
 
-    records, market = run_daily_recommender(top_n=args.top_n, export_csv=args.csv)
+    # The orchestrator always supplies a baseline; a direct run must derive its
+    # own, otherwise this script would happily compute on a half-formed intraday
+    # bar (or one synthesised from live quotes) and -- with --upload -- write a
+    # mis-dated prediction. Same protection, same default.
+    expected = None if args.no_session_check else last_completed_session(now_et()).isoformat()
+    if args.no_session_check:
+        print("⚠️  [--no-session-check] Session guard disabled. If the market is open, the")
+        print("    latest bar is incomplete and these numbers are NOT a tradable signal.\n")
+
+    records, market = run_daily_recommender(
+        top_n=args.top_n, export_csv=args.csv, expected_baseline=expected
+    )
 
     if args.upload and not args.dry_run:
+        if not records:
+            print("  ⚠️ No records produced; nothing to upload.\n")
+            sys.exit(1)
         try:
             from run_and_upload_recommendations import SupabaseSync, DAILY_TABLE
             sync = SupabaseSync()

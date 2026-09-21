@@ -1,8 +1,16 @@
 import os
+import sys
 from datetime import datetime
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+# Ensure sibling modules resolve when run directly from any working directory.
+_current_dir = os.path.dirname(os.path.abspath(__file__))
+if _current_dir not in sys.path:
+    sys.path.insert(0, _current_dir)
+
+from market_calendar import is_trading_day, next_trading_day
 
 # 1. Candidate Universe: S&P 500 / Nasdaq 100 leaders + High-Liquidity Sector & Asset ETFs
 UNIVERSE = {
@@ -104,10 +112,19 @@ def calculate_alpha_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     delta = close.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-    rs = gain / loss.replace(0, np.nan)
-    rsi_14 = (100 - (100 / (1 + rs))).iloc[-1]
-    if np.isnan(rsi_14):
+
+    # See the daily recommender for the full rationale: a window with no down
+    # days yields average loss 0, and the previous NaN fallback reported that
+    # as neutral 50 rather than the correct 100. Here rsi_14 > 75 carries an
+    # overbought penalty, which such names were escaping entirely.
+    _gain = gain.iloc[-1]
+    _loss = loss.iloc[-1]
+    if pd.isna(_gain) or pd.isna(_loss):
         rsi_14 = 50.0
+    elif _loss == 0:
+        rsi_14 = 100.0 if _gain > 0 else 50.0
+    else:
+        rsi_14 = float(100 - (100 / (1 + (_gain / _loss))))
 
     # 6. Average True Range (ATR 14) for stop-loss recommendation
     tr1 = high - low
@@ -172,7 +189,16 @@ def run_weekly_recommender(top_n: int = 10, export_csv: str = None):
     days_until_monday = (7 - last_dt.weekday()) % 7
     if days_until_monday == 0 and last_dt.weekday() != 0:
         days_until_monday = 7
-    week_start = (last_dt + pd.Timedelta(days=days_until_monday)).strftime("%Y-%m-%d")
+    _monday = (last_dt + pd.Timedelta(days=days_until_monday)).date()
+
+    # That Monday may be a market holiday (MLK, Presidents, Memorial, Labor...).
+    # The orchestrator keys the weekly row on next_trading_day(...), so writing a
+    # raw calendar Monday would mean the two never agree during a holiday week:
+    # the existence check would look for the Tuesday row, never find it, and the
+    # weekly job would regenerate on every single run. Anchor on the real first
+    # session of the week instead.
+    week_start_d = _monday if is_trading_day(_monday) else next_trading_day(_monday)
+    week_start = week_start_d.strftime("%Y-%m-%d")
 
     results = []
     for symbol, (sector, name) in UNIVERSE.items():
