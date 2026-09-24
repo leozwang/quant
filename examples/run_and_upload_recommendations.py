@@ -67,6 +67,36 @@ WEEKLY_CONFLICT_TARGET = "week_start_date,symbol"
 # already-settled rows back to NULL and destroy the accuracy history.
 SETTLEMENT_FIELDS = ("target_date_close", "predicted_diff")
 
+# Minimal columns required for batch settlement upsert:
+# 1. Unique conflict key (trade_date, symbol)
+# 2. Mandatory NOT NULL columns declared in doc/supabase_schema.sql without defaults
+# 3. Settlement columns owned by this stage (target_date_close, predicted_diff)
+# All 12 unowned columns (predicted_close, market_regime, ret_1d, ret_3d, vol_surge,
+# clv, rsi_7, rr_ratio, date, target_date, created_at, id) are excluded.
+SETTLEMENT_REQUIRED_COLUMNS = (
+    "trade_date",
+    "symbol",
+    "rank",
+    "name",
+    "sector",
+    "setup_type",
+    "close_price",
+    "alpha_score",
+    "stop_loss",
+    "target_t1",
+    "target_date_close",
+    "predicted_diff",
+)
+
+
+def _slim_settlement_payload(records: list) -> list:
+    """Extracts only conflict keys, mandatory NOT NULL schema columns, and settlement values.
+
+    Strips all unowned columns so settlement cannot touch or overwrite columns it doesn't own.
+    """
+    return [{k: r[k] for k in SETTLEMENT_REQUIRED_COLUMNS if k in r} for r in records]
+
+
 # "Eve-of-session": only generate recommendations when the next trading session
 # is at most this many calendar days away. Sunday -> Monday is 1 day (allowed);
 # Friday -> Monday is 3 days (skipped, since Sunday's run covers it).
@@ -116,7 +146,12 @@ class SupabaseUnavailable(RuntimeError):
 
     Treated as fail-closed: if we cannot prove that records are absent, we must
     not upload, otherwise a transient network error silently produces duplicates.
+    Includes an `is_transient` flag to differentiate network drops from non-transient 4xx errors.
     """
+
+    def __init__(self, message: str, is_transient: bool = False):
+        super().__init__(message)
+        self.is_transient = is_transient
 
 
 
@@ -228,7 +263,7 @@ class SupabaseSync:
                     backoff *= 2
                     continue
                 err_text = body.decode("utf-8", errors="replace")
-                raise SupabaseUnavailable(f"HTTP {e.code}: {err_text}") from e
+                raise SupabaseUnavailable(f"HTTP {e.code}: {err_text}", is_transient=False) from e
             except urllib.error.URLError as e:
                 err_str = str(e.reason).lower()
                 is_transient = isinstance(e.reason, TRANSIENT_NETWORK_ERRORS) or any(
@@ -251,7 +286,7 @@ class SupabaseSync:
                     time.sleep(delay)
                     backoff *= 2
                     continue
-                raise SupabaseUnavailable(f"{action_name} network error: {e.reason}") from e
+                raise SupabaseUnavailable(f"{action_name} network error: {e.reason}", is_transient=is_transient) from e
             except TRANSIENT_NETWORK_ERRORS as e:
                 if attempt < max_retries:
                     delay = backoff + random.uniform(0.1, 0.4)
@@ -262,11 +297,11 @@ class SupabaseSync:
                     time.sleep(delay)
                     backoff *= 2
                     continue
-                raise SupabaseUnavailable(f"{action_name} connection dropped after {max_retries} attempts: {e}") from e
+                raise SupabaseUnavailable(f"{action_name} connection dropped after {max_retries} attempts: {e}", is_transient=True) from e
             except Exception as e:
-                raise SupabaseUnavailable(f"{action_name} unexpected error: {e}") from e
+                raise SupabaseUnavailable(f"{action_name} unexpected error: {e}", is_transient=False) from e
 
-        raise SupabaseUnavailable(f"{action_name} exhausted all {max_retries} retry attempts")
+        raise SupabaseUnavailable(f"{action_name} exhausted all {max_retries} retry attempts", is_transient=True)
 
     def _get_json(self, path: str, timeout: int = 15, max_retries: int = 4):
         """Performs an authenticated GET and returns the decoded JSON body."""
@@ -466,12 +501,16 @@ class SupabaseSync:
 
         Uses PostgREST on_conflict=trade_date,symbol with resolution=merge-duplicates.
         Reduces N HTTP round-trips to 1, eliminating cumulative failure risk on edge proxies.
+        Slims the payload to only conflict keys, required schema columns, and settlement values.
+
+        Returns (ok: bool, message: str, is_transient: bool).
         """
         if not records:
-            return True, "No records to update."
+            return True, "No records to update.", False
 
         endpoint = f"{self.url}/rest/v1/{DAILY_TABLE}?on_conflict={DAILY_CONFLICT_TARGET}"
-        payload = json.dumps(records).encode("utf-8")
+        slim_payload = _slim_settlement_payload(records)
+        payload = json.dumps(slim_payload).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, headers=self._headers(prefer_merge=True), method="POST")
 
         try:
@@ -479,10 +518,12 @@ class SupabaseSync:
                 req, timeout=15, max_retries=4, action_name=f"Batch settlement update ({len(records)} records)"
             )
             if status in (200, 201, 204):
-                return True, f"Successfully batch-updated {len(records)} records in '{DAILY_TABLE}'."
-            return False, f"Supabase responded with status {status}."
+                return True, f"Successfully batch-updated {len(records)} records in '{DAILY_TABLE}'.", False
+            return False, f"Supabase responded with status {status}.", False
+        except SupabaseUnavailable as e:
+            return False, f"Failed to batch-update records: {e}", getattr(e, "is_transient", False)
         except Exception as e:
-            return False, f"Failed to batch-update records: {e}"
+            return False, f"Failed to batch-update records: {e}", False
 
     def update_daily_settlement(self, record_id: int, target_date_close: float, predicted_diff: float) -> tuple:
         """Updates target_date_close and predicted_diff for a specific daily recommendation row."""
@@ -761,13 +802,16 @@ def settle_target_date_predictions(sync: SupabaseSync, target_date: str = None, 
     # Execute batch update in a single atomic round-trip if updates are needed
     batch_ok = True
     batch_msg = ""
+    is_transient = False
     if to_update_records and not dry_run:
         print(f"  🚀 Batch updating {len(to_update_records)} settled record(s) in a single atomic Supabase round-trip...")
-        batch_ok, batch_msg = sync.batch_update_daily_settlement(to_update_records)
+        batch_ok, batch_msg, is_transient = sync.batch_update_daily_settlement(to_update_records)
         if batch_ok:
             print(f"  ✓ {batch_msg}\n")
+        elif is_transient:
+            print(f"  ⚠️ Batch update failed transiently ({batch_msg}), attempting fallback to individual row updates...\n")
         else:
-            print(f"  ⚠️ Batch update failed ({batch_msg}), attempting fallback to individual row updates...\n")
+            print(f"  ❌ Batch update failed with non-transient error ({batch_msg}). Skipping per-row fallback.\n")
 
     for item in row_meta:
         rec_id = item["rec_id"]
@@ -783,9 +827,11 @@ def settle_target_date_predictions(sync: SupabaseSync, target_date: str = None, 
         if item["needs_update"]:
             if batch_ok:
                 status_str = "✓ Settled"
-            else:
+            elif is_transient:
                 ok, msg = sync.update_daily_settlement(rec_id, actual_close, pred_diff)
                 status_str = "✓ Settled" if ok else f"⚠️ {msg}"
+            else:
+                status_str = f"⚠️ Batch Failed"
 
         pred_str = f"${pred_close:.2f}" if pred_close is not None else "N/A"
         act_str = f"${actual_close:.2f}" if actual_close is not None else "Pending"
