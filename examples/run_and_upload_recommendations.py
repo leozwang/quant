@@ -18,10 +18,15 @@ import base64
 from datetime import datetime, timedelta
 import errno
 import fcntl
+import http.client
 import json
 import os
+import random
+import socket
+import ssl
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -95,6 +100,17 @@ LOCK_PATH = os.path.join(tempfile.gettempdir(), "qlib_recommend_pipeline.lock")
 CONTINUOUS_TRADING = os.environ.get("QLIB_CONTINUOUS_TRADING", "").lower() in ("1", "true", "yes")
 
 
+TRANSIENT_NETWORK_ERRORS = (
+    http.client.RemoteDisconnected,
+    http.client.IncompleteRead,
+    ConnectionResetError,
+    BrokenPipeError,
+    TimeoutError,
+    socket.timeout,
+    ssl.SSLError,
+)
+
+
 class SupabaseUnavailable(RuntimeError):
     """Raised when an existence check cannot be completed.
 
@@ -164,6 +180,8 @@ class SupabaseSync:
             "Authorization": f"Bearer {self.key}",
             "Content-Type": "application/json",
             "Accept": "application/json",
+            "Connection": "close",
+            "User-Agent": "Mozilla/5.0 (compatible; QuantPipeline/1.0)",
         }
         if prefer_merge:
             headers["Prefer"] = "resolution=merge-duplicates"
@@ -176,25 +194,91 @@ class SupabaseSync:
         """True only when both a base URL and an API key are available."""
         return bool(self.url and self.key)
 
-    def _get_json(self, path: str, timeout: int = 15):
-        """Performs an authenticated GET and returns the decoded JSON body.
+    def _request_with_retry(
+        self,
+        req: urllib.request.Request,
+        timeout: int = 15,
+        max_retries: int = 4,
+        initial_backoff: float = 0.5,
+        action_name: str = "Supabase request",
+    ) -> tuple:
+        """Executes an HTTP request with retries and exponential backoff on transient network drops.
 
-        The Request is constructed inside the try: with an unset SUPABASE_URL the
-        relative path raises ValueError('unknown url type') at construction time,
-        which would otherwise escape as an unhandled traceback.
+        Returns (status_code, response_body_bytes).
+        Raises SupabaseUnavailable if all retries are exhausted.
         """
+        backoff = initial_backoff
+        for attempt in range(1, max_retries + 1):
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    body = resp.read()
+                    if attempt > 1:
+                        print(f"  ✓ [DEBUG/RETRY] {action_name} succeeded on attempt {attempt}/{max_retries}!")
+                    return resp.status, body
+            except urllib.error.HTTPError as e:
+                body = e.read()
+                # 429 (rate-limit) and 5xx gateway errors (502, 503, 504) are transient
+                if e.code in (429, 502, 503, 504) and attempt < max_retries:
+                    delay = backoff + random.uniform(0.1, 0.4)
+                    print(
+                        f"  ⚠️  [DEBUG/RETRY] {action_name} received HTTP {e.code} ({e.reason}). "
+                        f"Retrying in {delay:.2f}s (attempt {attempt}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    backoff *= 2
+                    continue
+                err_text = body.decode("utf-8", errors="replace")
+                raise SupabaseUnavailable(f"HTTP {e.code}: {err_text}") from e
+            except urllib.error.URLError as e:
+                err_str = str(e.reason).lower()
+                is_transient = isinstance(e.reason, TRANSIENT_NETWORK_ERRORS) or any(
+                    msg in err_str for msg in (
+                        "remote end closed",
+                        "incompleteread",
+                        "connection reset",
+                        "broken pipe",
+                        "timed out",
+                        "handshake",
+                        "eof occurred",
+                    )
+                )
+                if is_transient and attempt < max_retries:
+                    delay = backoff + random.uniform(0.1, 0.4)
+                    print(
+                        f"  ⚠️  [DEBUG/RETRY] {action_name} network drop ({e.reason}). "
+                        f"Retrying in {delay:.2f}s (attempt {attempt}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    backoff *= 2
+                    continue
+                raise SupabaseUnavailable(f"{action_name} network error: {e.reason}") from e
+            except TRANSIENT_NETWORK_ERRORS as e:
+                if attempt < max_retries:
+                    delay = backoff + random.uniform(0.1, 0.4)
+                    print(
+                        f"  ⚠️  [DEBUG/RETRY] {action_name} dropped: {type(e).__name__} ({e}). "
+                        f"Retrying in {delay:.2f}s (attempt {attempt}/{max_retries})..."
+                    )
+                    time.sleep(delay)
+                    backoff *= 2
+                    continue
+                raise SupabaseUnavailable(f"{action_name} connection dropped after {max_retries} attempts: {e}") from e
+            except Exception as e:
+                raise SupabaseUnavailable(f"{action_name} unexpected error: {e}") from e
+
+        raise SupabaseUnavailable(f"{action_name} exhausted all {max_retries} retry attempts")
+
+    def _get_json(self, path: str, timeout: int = 15, max_retries: int = 4):
+        """Performs an authenticated GET and returns the decoded JSON body."""
         if not self.is_configured:
             raise SupabaseUnavailable("Supabase credentials are not configured")
-        try:
-            req = urllib.request.Request(
-                f"{self.url}{path}", headers=self._headers(), method="GET"
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8"))
-        except SupabaseUnavailable:
-            raise
-        except Exception as e:
-            raise SupabaseUnavailable(str(e)) from e
+        req = urllib.request.Request(
+            f"{self.url}{path}", headers=self._headers(), method="GET"
+        )
+        _, body = self._request_with_retry(
+            req, timeout=timeout, max_retries=max_retries, action_name=f"GET {path.split('?')[0]}"
+        )
+        return json.loads(body.decode("utf-8"))
 
     def test_connection(self) -> tuple:
         """Pings Supabase to verify authorization and accessibility of *both* tables.
@@ -211,11 +295,11 @@ class SupabaseSync:
             try:
                 query_url = f"{self.url}/rest/v1/{table}?limit=1&select=id"
                 req = urllib.request.Request(query_url, headers=self._headers(), method="GET")
-                with urllib.request.urlopen(req, timeout=8):
-                    pass
-            except urllib.error.HTTPError as e:
-                err_body = e.read().decode("utf-8")
-                problems.append(f"{label} table '{table}' → HTTP {e.code}: {err_body}")
+                status, _ = self._request_with_retry(
+                    req, timeout=8, max_retries=4, action_name=f"Ping {label} table"
+                )
+                if status not in (200, 206):
+                    problems.append(f"{label} table '{table}' → HTTP {status}")
             except Exception as e:
                 problems.append(f"{label} table '{table}' → {e}")
 
@@ -300,20 +384,17 @@ class SupabaseSync:
             except SupabaseUnavailable as e:
                 return False, f"Skipped daily upload (fail-closed): {e}"
 
-        # on_conflict must name the UNIQUE(trade_date, symbol) constraint; without it
-        # PostgREST infers the `id` primary key and the upsert raises a duplicate key error.
         endpoint = f"{self.url}/rest/v1/{DAILY_TABLE}?on_conflict={DAILY_CONFLICT_TARGET}"
         payload = json.dumps(self._sanitize(records)).encode("utf-8")
         req = urllib.request.Request(endpoint, data=payload, headers=self._headers(prefer_merge=True), method="POST")
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status in (200, 201, 204):
-                    return True, f"Successfully uploaded {len(records)} daily records for {trade_date} to '{DAILY_TABLE}'."
-                return False, f"Supabase responded with status {resp.status}."
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8")
-            return False, f"Supabase HTTP {e.code} Error: {err_body}"
+            status, _ = self._request_with_retry(
+                req, timeout=15, max_retries=4, action_name=f"Upload {len(records)} daily records"
+            )
+            if status in (200, 201, 204):
+                return True, f"Successfully uploaded {len(records)} daily records for {trade_date} to '{DAILY_TABLE}'."
+            return False, f"Supabase responded with status {status}."
         except Exception as e:
             return False, f"Failed to upload daily records: {e}"
 
@@ -342,13 +423,12 @@ class SupabaseSync:
         req = urllib.request.Request(endpoint, data=payload, headers=self._headers(prefer_merge=True), method="POST")
 
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status in (200, 201, 204):
-                    return True, f"Successfully uploaded {len(records)} weekly records for {week_start_date} to '{WEEKLY_TABLE}'."
-                return False, f"Supabase responded with status {resp.status}."
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8")
-            return False, f"Supabase HTTP {e.code} Error: {err_body}"
+            status, _ = self._request_with_retry(
+                req, timeout=15, max_retries=4, action_name=f"Upload {len(records)} weekly records"
+            )
+            if status in (200, 201, 204):
+                return True, f"Successfully uploaded {len(records)} weekly records for {week_start_date} to '{WEEKLY_TABLE}'."
+            return False, f"Supabase responded with status {status}."
         except Exception as e:
             return False, f"Failed to upload weekly records: {e}"
 
@@ -381,6 +461,29 @@ class SupabaseSync:
             f"&select=target_date&order=target_date.asc&limit={UNSETTLED_QUERY_LIMIT}"
         )
 
+    def batch_update_daily_settlement(self, records: list) -> tuple:
+        """Batch-updates target_date_close and predicted_diff for multiple records in ONE atomic upsert.
+
+        Uses PostgREST on_conflict=trade_date,symbol with resolution=merge-duplicates.
+        Reduces N HTTP round-trips to 1, eliminating cumulative failure risk on edge proxies.
+        """
+        if not records:
+            return True, "No records to update."
+
+        endpoint = f"{self.url}/rest/v1/{DAILY_TABLE}?on_conflict={DAILY_CONFLICT_TARGET}"
+        payload = json.dumps(records).encode("utf-8")
+        req = urllib.request.Request(endpoint, data=payload, headers=self._headers(prefer_merge=True), method="POST")
+
+        try:
+            status, _ = self._request_with_retry(
+                req, timeout=15, max_retries=4, action_name=f"Batch settlement update ({len(records)} records)"
+            )
+            if status in (200, 201, 204):
+                return True, f"Successfully batch-updated {len(records)} records in '{DAILY_TABLE}'."
+            return False, f"Supabase responded with status {status}."
+        except Exception as e:
+            return False, f"Failed to batch-update records: {e}"
+
     def update_daily_settlement(self, record_id: int, target_date_close: float, predicted_diff: float) -> tuple:
         """Updates target_date_close and predicted_diff for a specific daily recommendation row."""
         endpoint = f"{self.url}/rest/v1/{DAILY_TABLE}?id=eq.{record_id}"
@@ -395,13 +498,12 @@ class SupabaseSync:
             method="PATCH"
         )
         try:
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                if resp.status in (200, 204):
-                    return True, f"Record {record_id} successfully updated"
-                return False, f"Record {record_id} update returned HTTP status {resp.status}"
-        except urllib.error.HTTPError as e:
-            err_body = e.read().decode("utf-8")
-            return False, f"Supabase HTTP {e.code} Error: {err_body}"
+            status, _ = self._request_with_retry(
+                req, timeout=15, max_retries=4, action_name=f"Update settlement row {record_id}"
+            )
+            if status in (200, 204):
+                return True, f"Record {record_id} successfully updated"
+            return False, f"Record {record_id} update returned HTTP status {status}"
         except Exception as e:
             return False, f"Failed to update record {record_id}: {e}"
 
@@ -598,6 +700,8 @@ def settle_target_date_predictions(sync: SupabaseSync, target_date: str = None, 
     settled_results = []
     abs_diffs = []
     pct_diffs = []
+    to_update_records = []
+    row_meta = []
 
     for r in records:
         rec_id = r["id"]
@@ -615,6 +719,7 @@ def settle_target_date_predictions(sync: SupabaseSync, target_date: str = None, 
             if pred_diff is None and pred_close is not None:
                 pred_diff = round(actual_close - pred_close, 2)
             status_str = "Already Settled"
+            needs_update = False
         else:
             actual_close = fetch_target_date_close(symbol, rec_target_date, now=now)
             if actual_close is not None:
@@ -625,12 +730,62 @@ def settle_target_date_predictions(sync: SupabaseSync, target_date: str = None, 
 
                 if dry_run:
                     status_str = "Dry Run (Preview)"
+                    needs_update = False
                 else:
-                    ok, msg = sync.update_daily_settlement(rec_id, actual_close, pred_diff)
-                    status_str = "✓ Settled" if ok else f"⚠️ {msg}"
+                    status_str = "Pending Upload"
+                    needs_update = True
             else:
                 pred_diff = None
                 status_str = "⚠️ Price Missing"
+                needs_update = False
+
+        updated_row = dict(r)
+        updated_row["target_date_close"] = actual_close
+        updated_row["predicted_diff"] = pred_diff
+        if needs_update:
+            to_update_records.append(updated_row)
+
+        row_meta.append({
+            "rec_id": rec_id,
+            "symbol": symbol,
+            "rank": rank,
+            "trade_date": trade_date,
+            "rec_target_date": rec_target_date,
+            "pred_close": pred_close,
+            "actual_close": actual_close,
+            "pred_diff": pred_diff,
+            "status_str": status_str,
+            "needs_update": needs_update,
+        })
+
+    # Execute batch update in a single atomic round-trip if updates are needed
+    batch_ok = True
+    batch_msg = ""
+    if to_update_records and not dry_run:
+        print(f"  🚀 Batch updating {len(to_update_records)} settled record(s) in a single atomic Supabase round-trip...")
+        batch_ok, batch_msg = sync.batch_update_daily_settlement(to_update_records)
+        if batch_ok:
+            print(f"  ✓ {batch_msg}\n")
+        else:
+            print(f"  ⚠️ Batch update failed ({batch_msg}), attempting fallback to individual row updates...\n")
+
+    for item in row_meta:
+        rec_id = item["rec_id"]
+        symbol = item["symbol"]
+        rank = item["rank"]
+        trade_date = item["trade_date"]
+        rec_target_date = item["rec_target_date"]
+        pred_close = item["pred_close"]
+        actual_close = item["actual_close"]
+        pred_diff = item["pred_diff"]
+        status_str = item["status_str"]
+
+        if item["needs_update"]:
+            if batch_ok:
+                status_str = "✓ Settled"
+            else:
+                ok, msg = sync.update_daily_settlement(rec_id, actual_close, pred_diff)
+                status_str = "✓ Settled" if ok else f"⚠️ {msg}"
 
         pred_str = f"${pred_close:.2f}" if pred_close is not None else "N/A"
         act_str = f"${actual_close:.2f}" if actual_close is not None else "Pending"
