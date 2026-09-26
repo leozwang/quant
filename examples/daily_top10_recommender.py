@@ -123,16 +123,20 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     today_open = float(open_p.iloc[-1])
     today_vol = float(volume.iloc[-1])
 
-    # 1. Immediate Return Velocity
+    # 1. Immediate & Medium-Term Return Velocity + Prior 4-Day Consolidation/Pullback
     ret_1d = (current_price / prev_price) - 1.0
     ret_3d = (current_price / float(close.iloc[-4])) - 1.0 if len(close) >= 4 else ret_1d
     ret_5d = (current_price / float(close.iloc[-6])) - 1.0 if len(close) >= 6 else ret_1d
+    ret_20d = (current_price / float(close.iloc[-21])) - 1.0 if len(close) >= 21 else ret_5d
+    prior_4d = (prev_price / float(close.iloc[-6])) - 1.0 if len(close) >= 6 else 0.0
 
-    # 2. Daily Relative Strength vs SPY Benchmark
+    # 2. Daily & 20-Day Structural Relative Strength vs SPY Benchmark
     spy_ret_1d = (float(spy_df["Close"].iloc[-1]) / float(spy_df["Close"].iloc[-2])) - 1.0
     spy_ret_3d = (float(spy_df["Close"].iloc[-1]) / float(spy_df["Close"].iloc[-4])) - 1.0 if len(spy_df) >= 4 else spy_ret_1d
+    spy_ret_20d = (float(spy_df["Close"].iloc[-1]) / float(spy_df["Close"].iloc[-21])) - 1.0 if len(spy_df) >= 21 else spy_ret_3d
     rs_1d = ret_1d - spy_ret_1d
     rs_3d = ret_3d - spy_ret_3d
+    rs_20d = ret_20d - spy_ret_20d
 
     # 3. Close Location Value (CLV) / Intraday Buying Pressure:
     # Ranges from -1.0 (closed at low) to +1.0 (closed at high).
@@ -166,7 +170,7 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     # A window with no down days makes average loss 0. Dividing by NaN and
     # falling back to 50 would report such a stock as *neutral* when it is in
     # fact maximally overbought (RSI 100 by definition). That matters here
-    # because rsi_7 > 82 carries a blow-off-top penalty and rsi_7 > 58 triggers
+    # because rsi_7 > 74 carries a blow-off-top penalty and rsi_7 > 65 triggers
     # the mean-reversion dampener -- so the strongest, most extended names were
     # silently escaping both guards.
     _gain = gain.iloc[-1]
@@ -186,13 +190,14 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
     bb_range = upper_band - lower_band
     pct_b = (current_price - lower_band) / bb_range if bb_range > 0 else 0.5
 
-    # 8. Average True Range (ATR 14) for precise daily risk brackets
+    # 8. Average True Range (ATR 14) for precise daily risk brackets & vol-adjusted returns
     tr1 = high - low
     tr2 = (high - close.shift(1)).abs()
     tr3 = (low - close.shift(1)).abs()
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     atr_14 = float(tr.rolling(window=14).mean().iloc[-1])
     atr_pct = (atr_14 / current_price) if current_price > 0 else 0.02
+    norm_ret_1d = (ret_1d / atr_pct) if atr_pct > 0 else 0.0
 
     # 9. Rolling 30-day Beta relative to SPY Benchmark
     asset_rets = close.pct_change().dropna()
@@ -208,17 +213,18 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
         beta = 1.0
 
     # 10. Setup Archetype Classification for Daily Strategy
-    # - BREAKOUT: Surge volume + close in top 25% of day + breaking recent highs
-    # - PULLBACK: In uptrend (above EMA20), dipped near EMA8, bouncing (CLV > 0)
-    # - MOMENTUM: Accelerating 3-day relative strength with positive slope
-    if vol_surge >= 1.3 and clv >= 0.50 and ret_1d > 0.005:
+    # - BREAKOUT: Surge volume + strong close in upper quartile of day range
+    # - PULLBACK: In 20D uptrend (above EMA20 or positive 20D RS), pulled back over prior 4 days, turning up today
+    # - OVERSOLD: Fast RSI < 38 with intraday buying support (CLV > 0.30) and not in 20D freefall
+    # - MOMENTUM: 20D relative leader with volume-supported continuation and non-exhausted RSI (<= 70)
+    if vol_surge >= 1.25 and clv >= 0.45 and ret_1d > 0.004:
         setup_type = "🚀 BREAKOUT"
-    elif micro_trend >= 2 and ret_1d < 0 and current_price >= ema_8 * 0.995:
+    elif (current_price >= ema_20 * 0.99 or rs_20d > 0) and prior_4d < -0.005 and (clv >= 0.25 or ret_1d > 0.002):
         setup_type = "⚡ PULLBACK"
-    elif rs_3d > 0.015 and micro_trend >= 2 and clv > 0.2:
-        setup_type = "📈 MOMENTUM"
-    elif rsi_7 < 38 and clv > 0.3:
+    elif rsi_7 < 38 and clv > 0.30 and rs_20d > -0.05:
         setup_type = "🛡️ OVERSOLD"
+    elif rs_20d > 0.015 and micro_trend >= 2 and clv >= 0.35 and vol_surge >= 1.05 and rsi_7 <= 70 and prior_4d <= 0.035:
+        setup_type = "📈 MOMENTUM"
     else:
         setup_type = "🎯 SWING"
 
@@ -227,8 +233,12 @@ def calculate_daily_factors(df: pd.DataFrame, spy_df: pd.DataFrame) -> dict:
         "ret_1d": ret_1d,
         "ret_3d": ret_3d,
         "ret_5d": ret_5d,
+        "ret_20d": ret_20d,
+        "prior_4d": prior_4d,
+        "norm_ret_1d": norm_ret_1d,
         "rs_1d": rs_1d,
         "rs_3d": rs_3d,
+        "rs_20d": rs_20d,
         "clv": clv,
         "vol_surge": vol_surge,
         "micro_trend": micro_trend,
@@ -425,31 +435,92 @@ def run_daily_recommender(top_n: int = 10, export_csv: str = None,
 
     res_df = pd.DataFrame(results)
 
-    # Standardize factors (Z-scores across the daily candidate pool)
-    z_ret1d = (res_df["ret_1d"] - res_df["ret_1d"].mean()) / (res_df["ret_1d"].std() or 1.0)
-    z_rs3d  = (res_df["rs_3d"] - res_df["rs_3d"].mean()) / (res_df["rs_3d"].std() or 1.0)
-    z_clv   = (res_df["clv"] - res_df["clv"].mean()) / (res_df["clv"].std() or 1.0)
-    z_vol   = (res_df["vol_surge"] - res_df["vol_surge"].mean()) / (res_df["vol_surge"].std() or 1.0)
-    z_trend = (res_df["micro_trend"] - res_df["micro_trend"].mean()) / (res_df["micro_trend"].std() or 1.0)
+    def _zscore(series: pd.Series, clip_min: float = -2.5, clip_max: float = 2.5) -> pd.Series:
+        std = series.std()
+        if std == 0 or pd.isna(std):
+            return pd.Series(0.0, index=series.index)
+        return ((series - series.mean()) / std).clip(clip_min, clip_max)
 
-    # Extreme RSI Penalties (> 82 extreme blow-off top risk, < 30 persistent falling knife)
-    rsi_penalty = np.where(res_df["rsi_7"] > 82, -0.7, 0.0) + np.where(res_df["rsi_7"] < 32, -0.5, 0.0)
+    # Sector-level 1D participation & 20D structural relative strength
+    res_df["sec_ret1d"] = res_df.groupby("sector")["ret_1d"].transform("mean")
+    res_df["sec_rs20d"] = res_df.groupby("sector")["rs_20d"].transform("mean")
+
+    # Standardize factors (winsorized across the daily candidate pool so single-day
+    # parabolic outliers do not hijack Rank #1-#2 right at short-term exhaustion)
+    z_norm_ret1d = _zscore(res_df["norm_ret_1d"], -2.0, 1.8)
+    z_vol        = _zscore(res_df["vol_surge"], -1.5, 2.2)
+    z_clv        = _zscore(res_df["clv"], -2.0, 2.0)
+    z_rs20d      = _zscore(res_df["rs_20d"], -2.0, 2.0)
+    z_sec_ret1d  = _zscore(res_df["sec_ret1d"], -2.0, 2.0)
+    z_sec_rs20d  = _zscore(res_df["sec_rs20d"], -2.0, 2.0)
+    z_prior4d    = _zscore(res_df["prior_4d"], -2.2, 2.2)
+
+    # Exhaustion & Regime Penalties:
+    # - Overbought fast RSI (> 74) or extended 4-day run-up prior to today (> +4.0%)
+    # - Multi-day rally (> +2.5% over 3D) on below-average volume (< 1.15x)
+    # - Persistent falling knife (RSI < 28)
+    # - Sector in multi-week distribution (sec_rs20d < -2.5%) without a volume breakout
+    exhaustion_penalty = (
+        np.where(res_df["rsi_7"] > 74, -0.65, 0.0)
+        + np.where(res_df["prior_4d"] > 0.04, -0.60, 0.0)
+        + np.where((res_df["ret_3d"] > 0.025) & (res_df["vol_surge"] < 1.15), -0.55, 0.0)
+        + np.where(res_df["rsi_7"] < 28, -0.45, 0.0)
+        + np.where((res_df["sec_rs20d"] < -0.025) & (res_df["vol_surge"] < 1.35), -0.35, 0.0)
+    )
+
+    setup_bonus = np.select(
+        [
+            res_df["setup_type"] == "🚀 BREAKOUT",
+            res_df["setup_type"] == "⚡ PULLBACK",
+            res_df["setup_type"] == "🛡️ OVERSOLD",
+            res_df["setup_type"] == "📈 MOMENTUM",
+        ],
+        [0.40, 0.35, 0.30, 0.20],
+        default=-0.15,
+    )
 
     # Daily Composite Alpha Score (Tailored for next-day conviction):
-    # - 25% Intraday Buying Pressure (CLV: did smart money buy the close?)
-    # - 20% Volume Surge (unusual participation)
-    # - 20% 3-Day Relative Strength vs SPY
-    # - 20% Micro-trend Alignment (EMA 3 > 8 > 20)
-    # - 15% 1-Day Momentum Velocity
+    # - 20% Volatility-adjusted 1-Day Ignition (ret_1d / atr_pct, winsorized at +1.8s)
+    # - 20% Volume Surge participation
+    # - 15% Intraday Buying Pressure (CLV: smart money accumulation into the close)
+    # - 15% 20-Day Structural Relative Strength vs SPY
+    # - 15% Sector Regime (10% Sector 1D Breadth + 5% Sector 20D Relative Trend)
+    # - 15% Prior 4-Day Consolidation/Pullback Spring (-z_prior4d: penalizes multi-day chasers)
     composite_score = (
-        0.25 * z_clv +
-        0.20 * z_vol +
-        0.20 * z_rs3d +
-        0.20 * z_trend +
-        0.15 * z_ret1d +
-        rsi_penalty
+        0.20 * z_norm_ret1d
+        + 0.20 * z_vol
+        + 0.15 * z_clv
+        + 0.15 * z_rs20d
+        + 0.10 * z_sec_ret1d
+        + 0.05 * z_sec_rs20d
+        - 0.15 * z_prior4d
+        + setup_bonus
+        + exhaustion_penalty
     )
     res_df["alpha_score"] = composite_score
+
+    # Compute expected 1D return BEFORE ranking so Ranking and Expected Value are unified
+    exp_market_ret = -0.0025 if "DEFENSIVE" in market_info["regime"] else 0.0008
+    beta_drag = res_df["beta"] * exp_market_ret
+    shrunk_alpha = (res_df["alpha_score"] * 0.0035).clip(-0.008, 0.010)
+    reversion_adj = np.where(
+        (res_df["prior_4d"] > 0.03) & (res_df["rsi_7"] > 65),
+        -0.25 * (res_df["prior_4d"] - 0.02),
+        np.where(
+            (res_df["prior_4d"] < -0.01) & (res_df["clv"] > 0.20),
+            0.15 * np.minimum(0.02, -res_df["prior_4d"]),
+            0.0,
+        ),
+    )
+    res_df["predicted_ret_1d"] = beta_drag + shrunk_alpha + reversion_adj
+    res_df["predicted_close"] = (res_df["price"] * (1.0 + res_df["predicted_ret_1d"])).round(2)
+
+    # Gate out / demote any candidate whose expected close is not above current close
+    res_df["alpha_score"] = np.where(
+        res_df["predicted_close"] <= res_df["price"],
+        res_df["alpha_score"] - 1.0,
+        res_df["alpha_score"],
+    )
 
     # Sort candidates by alpha score
     sorted_df = res_df.sort_values(by="alpha_score", ascending=False).reset_index(drop=True)
@@ -496,25 +567,7 @@ def run_daily_recommender(top_n: int = 10, export_csv: str = None,
     for i, r in top_df.iterrows():
         p = r["price"]
         atr = r["atr_14"]
-        
-        # Model 2: Conservative Beta-Drag & Mean-Reversion Expected Value
-        # 1. Market Expected Return & Asset Beta Contribution:
-        exp_market_ret = -0.003 if "DEFENSIVE" in market_info["regime"] else 0.0008
-        beta_val = r.get("beta", 1.0)
-        beta_drag = beta_val * exp_market_ret
-
-        # 2. Bayesian Shrinkage on Alpha Conviction (0.0035 multiplier instead of 0.0075):
-        shrunk_alpha = max(-0.008, min(0.010, r["alpha_score"] * 0.0035))
-
-        # 3. Overextension & Mean-Reversion Dampener:
-        reversion_adj = 0.0
-        if r["ret_1d"] > 0.02 and r["rsi_7"] > 58:
-            reversion_adj = -0.30 * (r["ret_1d"] - 0.015)
-        elif r["ret_1d"] < -0.005 and r["clv"] > 0.1:
-            reversion_adj = +0.15 * min(0.015, -r["ret_1d"])
-
-        predicted_ret_1d = beta_drag + shrunk_alpha + reversion_adj
-        predicted_close = round(p * (1.0 + predicted_ret_1d), 2)
+        predicted_close = float(r["predicted_close"])
 
         # Dynamic Tight Stop-Loss for Daily Trades:
         # Max risk is min(1.0 * ATR, 2.5% of price) to ensure capital preservation
