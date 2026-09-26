@@ -315,18 +315,17 @@ class SupabaseSync:
         )
         return json.loads(body.decode("utf-8"))
 
-    def test_connection(self) -> tuple:
-        """Pings Supabase to verify authorization and accessibility of *both* tables.
-
-        The weekly table is checked too: it is only written on Sundays, so a
-        permissions or migration problem there would otherwise stay invisible
-        for up to a week before failing at upload time.
-        """
+    def test_connection(self, check_weekly: bool = False) -> tuple:
+        """Pings Supabase to verify authorization and accessibility of the daily table."""
         if not self.is_configured:
             return False, "Supabase credentials are not configured"
 
+        tables = [("daily", DAILY_TABLE)]
+        if check_weekly:
+            tables.append(("weekly", WEEKLY_TABLE))
+
         problems = []
-        for label, table in (("daily", DAILY_TABLE), ("weekly", WEEKLY_TABLE)):
+        for label, table in tables:
             try:
                 query_url = f"{self.url}/rest/v1/{table}?limit=1&select=id"
                 req = urllib.request.Request(query_url, headers=self._headers(), method="GET")
@@ -340,7 +339,7 @@ class SupabaseSync:
 
         if problems:
             return False, "; ".join(problems)
-        return True, "OK (daily + weekly tables reachable)"
+        return True, "OK (daily table reachable)" if not check_weekly else "OK (daily + weekly tables reachable)"
 
     def has_daily_records(self, trade_date: str) -> bool:
         """Checks if daily recommendations already exist for the specified trade_date.
@@ -1016,17 +1015,16 @@ def build_execution_plan(sync: SupabaseSync, args, now: datetime = None) -> dict
         plan["settle_reason"] = f"mode={args.mode}"
 
     # ------------------------------------------------------------- recommend
+    # Weekly recommendations are disabled by default; only run if --weekly-only is explicitly passed.
     recommend_modes = ("recommend", "auto", "both")
     want_daily = args.mode in recommend_modes and not weekly_only
-    want_weekly = args.mode in recommend_modes and not daily_only
+    want_weekly = args.mode in recommend_modes and weekly_only
 
-    # Explicit reasons for the "one half suppressed by a CLI flag" case, so
-    # --explain never prints an empty justification.
     if args.mode in recommend_modes:
         if weekly_only:
             plan["daily_reason"] = "--weekly-only"
-        if daily_only:
-            plan["weekly_reason"] = "--daily-only"
+        else:
+            plan["weekly_reason"] = "disabled"
 
     target = next_trading_day(last_completed_session(now))
     plan["target_session"] = target
@@ -1035,10 +1033,16 @@ def build_execution_plan(sync: SupabaseSync, args, now: datetime = None) -> dict
     if want_daily or want_weekly:
         if auto and plan["market_open"]:
             reason = "market is currently open; bars are incomplete"
-            plan["daily_reason"] = plan["weekly_reason"] = reason
+            if want_daily:
+                plan["daily_reason"] = reason
+            if want_weekly:
+                plan["weekly_reason"] = reason
         elif auto and not (0 <= plan["gap_days"] <= MAX_EVE_GAP_DAYS):
             reason = f"next session is {plan['gap_days']}d away (eve-of-session allows <= {MAX_EVE_GAP_DAYS}d)"
-            plan["daily_reason"] = plan["weekly_reason"] = reason
+            if want_daily:
+                plan["daily_reason"] = reason
+            if want_weekly:
+                plan["weekly_reason"] = reason
         else:
             target_str = target.isoformat()
 
