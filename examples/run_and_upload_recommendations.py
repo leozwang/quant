@@ -184,17 +184,28 @@ def load_dotenv(override: bool = True):
     return None
 
 
-def get_jwt_project_ref(token: str) -> str:
-    """Extracts project 'ref' from JWT payload without verifying signature."""
+def _jwt_claims(token: str) -> dict:
+    """Decodes a JWT payload without verifying the signature ({} if not a JWT)."""
     try:
         parts = token.split(".")
         if len(parts) >= 2:
             padding = "=" * (4 - len(parts[1]) % 4)
             payload_data = base64.urlsafe_b64decode(parts[1] + padding)
-            return json.loads(payload_data.decode("utf-8")).get("ref", "")
+            claims = json.loads(payload_data.decode("utf-8"))
+            return claims if isinstance(claims, dict) else {}
     except Exception:
         pass
-    return ""
+    return {}
+
+
+def get_jwt_project_ref(token: str) -> str:
+    """Extracts project 'ref' from JWT payload without verifying signature."""
+    return _jwt_claims(token).get("ref", "")
+
+
+def get_jwt_role(token: str) -> str:
+    """Extracts the Postgres role ('anon', 'service_role', ...) a legacy Supabase key maps to."""
+    return _jwt_claims(token).get("role", "")
 
 
 class SupabaseSync:
@@ -890,12 +901,18 @@ def run_sanity_check(sync: SupabaseSync, dry_run: bool = False):
         print(f"      • SUPABASE_KEY : {'[CONFIGURED]' if sync.key else '[MISSING]'}")
         print("      -> Set environment variables or create a .env file (see .env.example):")
         print("         export SUPABASE_URL=\"https://<your-project-id>.supabase.co\"")
-        print("         export SUPABASE_KEY=\"<your-anon-or-service-key>\"")
+        print("         export SUPABASE_KEY=\"<your-service-role-key>\"")
     else:
         key_ref = get_jwt_project_ref(sync.key)
+        key_role = get_jwt_role(sync.key)
         print("  ✓ Supabase credentials configured:")
         print(f"      • SUPABASE_URL : {sync.url}")
-        print(f"      • SUPABASE_KEY : Project Ref '{key_ref if key_ref else 'Custom'}'")
+        print(f"      • SUPABASE_KEY : Project Ref '{key_ref if key_ref else 'Custom'}' · role '{key_role or 'unknown'}'")
+        if key_role == "anon":
+            # Uploads and settlement write rows; once doc/supabase_anon_read_only.sql
+            # has been applied the public anon key can only read.
+            print("      ℹ️  This is the public anon key. After doc/supabase_anon_read_only.sql is applied,")
+            print("         uploads and settlement require the service_role key (see README).")
 
     if sync.url and sync.key and not dry_run:
         is_ok, msg = sync.test_connection()

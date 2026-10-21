@@ -7,6 +7,14 @@
 --   supabase db query --linked -f src/qlib/doc/supabase_schema.sql
 -- Or paste into Supabase Web SQL Editor:
 --   https://supabase.com/dashboard/project/<your-project-id>/sql/new
+--
+-- Access model:
+--   * The pipeline writes with the service_role key (a server-side secret).
+--   * The public anon key (and signed-in users) can only read.
+--   Since 2026-10-30 Supabase no longer grants Data API access to new tables
+--   in "public" automatically, so each table below carries explicit GRANTs.
+--   Existing projects do not need to re-run this file; to move tables created
+--   before that date to this access model, run doc/supabase_anon_read_only.sql once.
 -- ====================================================================
 
 -- --------------------------------------------------------------------
@@ -39,6 +47,11 @@ CREATE TABLE IF NOT EXISTS public.qlib_daily_top10_recommend (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     CONSTRAINT uq_qlib_daily_date_symbol UNIQUE (trade_date, symbol)
 );
+
+-- Explicit Data API grants (required for tables created on/after 2026-10-30).
+REVOKE ALL ON public.qlib_daily_top10_recommend FROM anon, authenticated;
+GRANT SELECT ON public.qlib_daily_top10_recommend TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.qlib_daily_top10_recommend TO service_role;
 
 -- Trigger to auto-compute predicted price difference:
 -- predicted_diff = target_date_close - predicted_close (vs Point Forecast)
@@ -90,6 +103,11 @@ CREATE TABLE IF NOT EXISTS public.qlib_weekly_top10_recommend (
     CONSTRAINT uq_qlib_weekly_date_symbol UNIQUE (week_start_date, symbol)
 );
 
+-- Explicit Data API grants (required for tables created on/after 2026-10-30).
+REVOKE ALL ON public.qlib_weekly_top10_recommend FROM anon, authenticated;
+GRANT SELECT ON public.qlib_weekly_top10_recommend TO anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON public.qlib_weekly_top10_recommend TO service_role;
+
 CREATE INDEX IF NOT EXISTS idx_qlib_weekly_date ON public.qlib_weekly_top10_recommend(week_start_date);
 CREATE INDEX IF NOT EXISTS idx_qlib_weekly_symbol ON public.qlib_weekly_top10_recommend(symbol);
 CREATE INDEX IF NOT EXISTS idx_qlib_weekly_rank ON public.qlib_weekly_top10_recommend(week_start_date, rank);
@@ -100,10 +118,15 @@ CREATE INDEX IF NOT EXISTS idx_qlib_weekly_rank ON public.qlib_weekly_top10_reco
 ALTER TABLE public.qlib_daily_top10_recommend ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.qlib_weekly_top10_recommend ENABLE ROW LEVEL SECURITY;
 
+-- Read-only for anon/authenticated. The pipeline writes with the service_role
+-- key, which bypasses RLS. The old allow-everything policies are dropped so
+-- re-running this file on an older project converges to the same state.
 DROP POLICY IF EXISTS "anon_qlib_daily_policy" ON public.qlib_daily_top10_recommend;
-CREATE POLICY "anon_qlib_daily_policy" ON public.qlib_daily_top10_recommend
-    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "qlib_daily_read" ON public.qlib_daily_top10_recommend;
+CREATE POLICY "qlib_daily_read" ON public.qlib_daily_top10_recommend
+    FOR SELECT TO anon, authenticated USING (true);
 
 DROP POLICY IF EXISTS "anon_qlib_weekly_policy" ON public.qlib_weekly_top10_recommend;
-CREATE POLICY "anon_qlib_weekly_policy" ON public.qlib_weekly_top10_recommend
-    FOR ALL TO anon, authenticated USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "qlib_weekly_read" ON public.qlib_weekly_top10_recommend;
+CREATE POLICY "qlib_weekly_read" ON public.qlib_weekly_top10_recommend
+    FOR SELECT TO anon, authenticated USING (true);

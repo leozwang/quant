@@ -57,9 +57,11 @@ Set your project variables inside `src/qlib/.env`:
 ```env
 SUPABASE_PROJECT_ID=<your-project-id>
 SUPABASE_URL=https://<your-project-id>.supabase.co
-SUPABASE_KEY=<your-anon-or-service-role-key>
+SUPABASE_KEY=<your-service-role-key>
 ```
 *(Alternatively, export them directly in your shell: `export SUPABASE_URL=...` and `export SUPABASE_KEY=...`)*
+
+> **Use the `service_role` key** (Dashboard → Project Settings → API Keys → Legacy API Keys). The pipeline inserts and updates rows, while the public `anon` key is read-only (see `doc/supabase_anon_read_only.sql`). The `service_role` key is a server-side secret: never commit it or ship it in client code.
 
 ---
 
